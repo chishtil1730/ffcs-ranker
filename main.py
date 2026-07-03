@@ -2,6 +2,16 @@
 
 Usage:
     python main.py [--pdf-folder ./pdfs] [--ratings-file ./ratings.xlsx] [--output-folder ./output]
+
+--ratings-file can point at:
+    - a single .xlsx/.csv file, or
+    - a folder containing multiple .xlsx/.csv ratings files (all of them are
+      loaded and merged into one lookup table before matching).
+
+Each PDF in --pdf-folder is parsed and matched independently, and gets its
+own set of output CSVs (named after the PDF), rather than everything being
+combined into one report. This keeps e.g. two PDFs for two different
+subjects from being merged into a single list.
 """
 from __future__ import annotations
 
@@ -11,10 +21,10 @@ from pathlib import Path
 
 import pandas as pd
 
-from excel_export import export_workbook
+from csv_export import export_csvs
 from matcher import classify, match_name
 from normalizer import normalize_name
-from pdf_parser import parse_pdf_folder
+from pdf_parser import parse_pdf
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +36,8 @@ RATINGS_COLUMN_ALIASES = {
     "review_count": ["total raters", "review count", "reviews", "num reviews", "raters"],
     "department": ["department", "dept", "school"],
 }
+
+RATINGS_FILE_SUFFIXES = {".csv", ".xlsx", ".xls"}
 
 
 def setup_logging(output_folder: Path) -> None:
@@ -40,8 +52,9 @@ def setup_logging(output_folder: Path) -> None:
     )
 
 
-def load_ratings(path: Path) -> tuple[pd.DataFrame, dict[str, str]]:
-    """Load ratings CSV/XLSX and map its columns to canonical fields, without
+def _load_single_ratings_file(path: Path) -> pd.DataFrame:
+    """Load one ratings CSV/XLSX and rename its columns to canonical field
+    names (faculty/rating/difficulty/review_count/department), without
     assuming a fixed schema."""
     if path.suffix.lower() == ".csv":
         df = pd.read_csv(path)
@@ -57,14 +70,49 @@ def load_ratings(path: Path) -> tuple[pd.DataFrame, dict[str, str]]:
                 break
     if "faculty" not in resolved:
         raise ValueError(f"Could not find a faculty-name column in {path}. Columns: {list(df.columns)}")
-    logger.info("Ratings column mapping: %s", resolved)
-    return df, resolved
+
+    logger.info("Ratings column mapping for %s: %s", path.name, resolved)
+    df = df.rename(columns={orig: field for field, orig in resolved.items()})
+    keep_cols = [c for c in ("faculty", "rating", "difficulty", "review_count", "department") if c in df.columns]
+    df = df[keep_cols].copy()
+    df["__source_file"] = path.name
+    return df
 
 
-def build_output_frames(slot_rows, ratings_df: pd.DataFrame, colmap: dict[str, str]):
-    faculty_col = colmap["faculty"]
-    candidate_names = ratings_df[faculty_col].dropna().astype(str).unique().tolist()
-    ratings_by_name = {row[faculty_col]: row for _, row in ratings_df.iterrows()}
+def load_ratings(path: Path) -> pd.DataFrame:
+    """Load ratings from a single file, or from every ratings file in a
+    folder, merged into one lookup table keyed by faculty name.
+
+    If the same faculty name (after normalization) appears in more than one
+    file, the first occurrence found wins and a warning is logged so the
+    conflict isn't silent.
+    """
+    if path.is_dir():
+        files = sorted(p for p in path.iterdir() if p.suffix.lower() in RATINGS_FILE_SUFFIXES)
+        if not files:
+            raise ValueError(f"No ratings files (.csv/.xlsx/.xls) found in folder {path}")
+    else:
+        files = [path]
+
+    frames = [_load_single_ratings_file(f) for f in files]
+    combined = pd.concat(frames, ignore_index=True)
+
+    combined["__norm_faculty"] = combined["faculty"].astype(str).apply(normalize_name)
+    dupe_mask = combined.duplicated(subset="__norm_faculty", keep="first")
+    for _, row in combined[dupe_mask].iterrows():
+        logger.warning(
+            "Duplicate faculty '%s' found in %s; keeping the first entry seen for this name.",
+            row["faculty"], row["__source_file"],
+        )
+    combined = combined[~dupe_mask].drop(columns=["__norm_faculty", "__source_file"]).reset_index(drop=True)
+
+    logger.info("Loaded %d ratings rows from %d file(s): %s", len(combined), len(files), [f.name for f in files])
+    return combined
+
+
+def build_output_frames(slot_rows, ratings_df: pd.DataFrame):
+    candidate_names = ratings_df["faculty"].dropna().astype(str).unique().tolist()
+    ratings_by_name = {row["faculty"]: row for _, row in ratings_df.iterrows()}
 
     # Cache one match result per unique PDF faculty name (avoid recomputation per slot row).
     unique_names = sorted({row.faculty for row in slot_rows})
@@ -83,10 +131,10 @@ def build_output_frames(slot_rows, ratings_df: pd.DataFrame, colmap: dict[str, s
                 "Matched Faculty": result.matched_name,
                 "Slot": row.slot,
                 "Venue": row.venue,
-                "Rating": rdata.get(colmap.get("rating", ""), None),
-                "Difficulty": rdata.get(colmap.get("difficulty", ""), None),
-                "Review Count": rdata.get(colmap.get("review_count", ""), None),
-                "Department": rdata.get(colmap.get("department", ""), None),
+                "Rating": rdata.get("rating", None),
+                "Difficulty": rdata.get("difficulty", None),
+                "Review Count": rdata.get("review_count", None),
+                "Department": rdata.get("department", None),
                 "Confidence": round(result.score, 1),
             })
         elif bucket == "review":
@@ -113,24 +161,39 @@ def build_output_frames(slot_rows, ratings_df: pd.DataFrame, colmap: dict[str, s
     return matched_df, review_df, unmatched_df, stats
 
 
-def run(pdf_folder: Path, ratings_file: Path, output_folder: Path) -> Path:
+def run(pdf_folder: Path, ratings_file: Path, output_folder: Path) -> list[Path]:
     setup_logging(output_folder)
-    slot_rows = parse_pdf_folder(pdf_folder)
-    if not slot_rows:
-        raise RuntimeError(f"No slot rows extracted from any PDF in {pdf_folder}")
-    ratings_df, colmap = load_ratings(ratings_file)
-    matched_df, review_df, unmatched_df, stats = build_output_frames(slot_rows, ratings_df, colmap)
 
-    output_path = output_folder / "faculty_slots_with_ratings.xlsx"
-    export_workbook(matched_df, review_df, unmatched_df, stats, output_path)
-    logger.info("Done. Stats: %s", stats)
-    return output_path
+    pdf_paths = sorted(Path(pdf_folder).glob("*.pdf"))
+    if not pdf_paths:
+        raise RuntimeError(f"No PDFs found in {pdf_folder}")
+
+    ratings_df = load_ratings(ratings_file)
+
+    all_written: list[Path] = []
+    for pdf_path in pdf_paths:
+        slot_rows = parse_pdf(pdf_path)
+        if not slot_rows:
+            logger.warning("No slot rows extracted from %s; skipping.", pdf_path.name)
+            continue
+
+        matched_df, review_df, unmatched_df, stats = build_output_frames(slot_rows, ratings_df)
+        prefix = pdf_path.stem
+        written = export_csvs(matched_df, review_df, unmatched_df, stats, output_folder, prefix)
+        all_written.extend(written)
+        logger.info("Done with %s. Stats: %s", pdf_path.name, stats)
+
+    if not all_written:
+        raise RuntimeError(f"No slot rows extracted from any PDF in {pdf_folder}")
+
+    return all_written
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Parse FFCS PDFs and merge with faculty ratings.")
     parser.add_argument("--pdf-folder", default="./pdfs", type=Path)
-    parser.add_argument("--ratings-file", default="./ratings.xlsx", type=Path)
+    parser.add_argument("--ratings-file", default="./ratings.xlsx", type=Path,
+                         help="A single ratings file, or a folder of ratings files to merge.")
     parser.add_argument("--output-folder", default="./output", type=Path)
     args = parser.parse_args()
     run(args.pdf_folder, args.ratings_file, args.output_folder)
