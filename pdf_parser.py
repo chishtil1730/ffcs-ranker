@@ -1,4 +1,4 @@
-"""Extract Slot / Venue / Faculty rows from VIT FFCS registration PDFs."""
+"""Parse and Extract Slot / Venue / Faculty rows from VIT FFCS registration PDFs."""
 from __future__ import annotations
 
 import logging
